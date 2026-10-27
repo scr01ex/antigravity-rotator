@@ -1,0 +1,32 @@
+# Sensitive credentials and tokens
+accounts.json
+*.json.bak
+.env
+.env.local
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE configurations
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs & Runtime
+*.log
+*.pid
+.rotator.pid
