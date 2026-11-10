@@ -28,5 +28,6 @@ ENV/
 
 # Logs & Runtime
 *.log
+*.log.*
 *.pid
 .rotator.pid
