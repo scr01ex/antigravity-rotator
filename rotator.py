@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 import atexit
 import http.client
+import json
 import logging
+import re
 import signal
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
-from typing import Optional
+from typing import Optional, Union
 
 from account_manager import configure_ide, unconfigure_ide
 from auth import load_accounts, save_accounts, refresh_account_token
 from config import (
-    HOST, PORT, UPSTREAM_URL, COOLDOWN_SECONDS, UPSTREAM_TIMEOUT,
-    LOG_FILE, LOG_MAX_BYTES, LOG_BACKUP_COUNT,
+    HOST, PORT, UPSTREAM_URL, COOLDOWN_SECONDS, COOLDOWN_BUFFER_SECONDS,
+    UPSTREAM_TIMEOUT, LOG_FILE, LOG_MAX_BYTES, LOG_BACKUP_COUNT,
 )
 
 _log_formatter = logging.Formatter(
@@ -69,6 +72,123 @@ def notify_desktop(title: str, text: str) -> None:
             subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], capture_output=True, check=False)
     except (FileNotFoundError, OSError):
         pass
+
+
+def parse_iso_timestamp(ts_str: str) -> Optional[datetime]:
+    if not isinstance(ts_str, str):
+        return None
+    s = ts_str.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s)
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def parse_duration_string(val: Union[str, int, float]) -> Optional[float]:
+    if isinstance(val, (int, float)):
+        return float(val)
+    if not isinstance(val, str):
+        return None
+    s = val.strip()
+    if not s:
+        return None
+
+    try:
+        return float(s)
+    except ValueError:
+        pass
+
+    pattern = r"^(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s)?$"
+    match = re.match(pattern, s)
+    if match and any(match.groups()):
+        h = float(match.group(1)) if match.group(1) else 0.0
+        m = float(match.group(2)) if match.group(2) else 0.0
+        sec = float(match.group(3)) if match.group(3) else 0.0
+        return h * 3600.0 + m * 60.0 + sec
+    return None
+
+
+def parse_quota_reset_delay(
+    response_body: Union[str, bytes],
+    default_cooldown: float = COOLDOWN_SECONDS,
+    buffer_seconds: float = COOLDOWN_BUFFER_SECONDS,
+) -> float:
+    if isinstance(response_body, bytes):
+        body_text = response_body.decode("utf-8", errors="ignore").strip()
+    else:
+        body_text = str(response_body).strip()
+
+    if not body_text:
+        return float(default_cooldown)
+
+    raw_seconds: Optional[float] = None
+
+    try:
+        data = json.loads(body_text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        data = None
+
+    if isinstance(data, dict):
+        metadata_list = []
+        err = data.get("error")
+        if isinstance(err, dict):
+            details = err.get("details")
+            if isinstance(details, list):
+                for d in details:
+                    if isinstance(d, dict) and isinstance(d.get("metadata"), dict):
+                        metadata_list.append(d["metadata"])
+        if isinstance(data.get("details"), list):
+            for d in data["details"]:
+                if isinstance(d, dict) and isinstance(d.get("metadata"), dict):
+                    metadata_list.append(d["metadata"])
+        if isinstance(data.get("metadata"), dict):
+            metadata_list.append(data["metadata"])
+
+        for meta in metadata_list:
+            ts_str = meta.get("quotaResetTimeStamp") or meta.get("quota_reset_timestamp")
+            if ts_str and isinstance(ts_str, str):
+                dt = parse_iso_timestamp(ts_str)
+                if dt is not None:
+                    now_utc = datetime.now(timezone.utc)
+                    raw_seconds = (dt - now_utc).total_seconds()
+                    break
+
+        if raw_seconds is None:
+            for meta in metadata_list:
+                delay_str = meta.get("quotaResetDelay") or meta.get("quota_reset_delay")
+                if delay_str:
+                    sec = parse_duration_string(delay_str)
+                    if sec is not None:
+                        raw_seconds = sec
+                        break
+
+    if raw_seconds is None:
+        match = re.search(
+            r"Resets in\s*:?\s*((?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?)",
+            body_text,
+            re.IGNORECASE,
+        )
+        if match and any(match.groups()[1:]):
+            h = float(match.group(2)) if match.group(2) else 0.0
+            m = float(match.group(3)) if match.group(3) else 0.0
+            s = float(match.group(4)) if match.group(4) else 0.0
+            raw_seconds = h * 3600.0 + m * 60.0 + s
+
+    if raw_seconds is None:
+        return float(default_cooldown)
+
+    if raw_seconds < 5.0:
+        return 30.0
+
+    return max(30.0, raw_seconds + buffer_seconds)
 
 
 class AccountPool:
@@ -132,17 +252,38 @@ class AccountPool:
 
             return account.get("access_token")
 
-    def mark_cooldown(self, account_name: str) -> None:
+    def mark_cooldown(
+        self,
+        account_name: str,
+        cooldown_seconds: Optional[float] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        if cooldown_seconds is None:
+            cooldown_seconds = float(COOLDOWN_SECONDS)
+
+        until_time = time.time() + cooldown_seconds
+        reset_time_str = datetime.fromtimestamp(until_time).strftime("%Y-%m-%d %H:%M:%S")
+
         with self.lock:
             accounts = load_accounts()
             for acc in accounts:
                 if acc.get("name") == account_name:
-                    acc["cooldown_until"] = time.time() + COOLDOWN_SECONDS
-                    logger.warning(
-                        "Account '%s' entered cooldown for %d seconds",
-                        account_name,
-                        COOLDOWN_SECONDS,
-                    )
+                    acc["cooldown_until"] = until_time
+                    if reason and any(k in reason.lower() for k in ("401", "403", "verification", "unauthenticated", "refresh")):
+                        logger.warning(
+                            "Account '%s' %s. Cooldown set to %ds (until %s)",
+                            account_name,
+                            reason,
+                            int(cooldown_seconds),
+                            reset_time_str,
+                        )
+                    else:
+                        logger.warning(
+                            "Account '%s' quota exceeded (429). Cooldown set to %ds (until %s)",
+                            account_name,
+                            int(cooldown_seconds),
+                            reset_time_str,
+                        )
                     break
             save_accounts(accounts)
 
@@ -240,7 +381,7 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
             token = pool.ensure_account_token(account)
             if not token:
                 logger.error("Failed to refresh token for '%s', skipping", acc_name)
-                pool.mark_cooldown(acc_name)
+                pool.mark_cooldown(acc_name, reason="failed to refresh token")
                 continue
 
             headers_to_send["Authorization"] = f"Bearer {token}"
@@ -279,15 +420,20 @@ class RotatorProxyHandler(BaseHTTPRequestHandler):
                         )
 
                 if should_rotate:
-                    err_preview = resp.read(512).decode("utf-8", errors="ignore").strip()
+                    err_bytes = resp.read(65536)
+                    err_preview = err_bytes.decode("utf-8", errors="ignore").strip()
                     logger.warning(
                         "%s on account '%s' for %s: %s",
                         cooldown_reason,
                         acc_name,
                         clean_path,
-                        err_preview,
+                        err_preview[:512],
                     )
-                    pool.mark_cooldown(acc_name)
+                    if resp.status == 429:
+                        cooldown_sec = parse_quota_reset_delay(err_preview)
+                        pool.mark_cooldown(acc_name, cooldown_seconds=cooldown_sec)
+                    else:
+                        pool.mark_cooldown(acc_name, reason=cooldown_reason)
                     conn.close()
 
                     notify_desktop("Antigravity Rotator", notify_msg)

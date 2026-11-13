@@ -4,7 +4,7 @@ A local HTTP proxy and multi-account credential rotator for **Antigravity** (inc
 
 ## Key Features
 
-- **Transparent Network-Level Failover:** Intercepts HTTP 429 (`RESOURCE_EXHAUSTED`), HTTP 403 (security checkup / verification required), and HTTP 401 status codes and immediately rotates to the next available account without dropping the active session or failing generation in Antigravity.
+- **Transparent Network-Level Failover & Dynamic Cooldown:** Intercepts HTTP 429 (`RESOURCE_EXHAUSTED`), dynamically calculates cooldown from Google's `quotaResetTimeStamp` / `quotaResetDelay`, intercepts HTTP 403 (security checkup / verification required) and HTTP 401 status codes, and immediately rotates to the next available account without dropping the active session or failing generation in Antigravity.
 - **Automated OAuth Refresh & Disk Persistence:** Automatically handles Google OAuth `access_token` refreshes prior to token expiration and immediately synchronizes state to disk.
 - **Server-Sent Events (SSE) / Streaming:** Supports `Transfer-Encoding: chunked` for real-time model completions without buffering latency.
 - **Duplicate Prevention:** Prevents duplicate registration of the same Google account under different identifiers.
@@ -23,7 +23,8 @@ Configuration values can be provided via environment variables or a local `.env`
 | `ROTATOR_HOST` | `127.0.0.1` | Local bind address |
 | `ROTATOR_PORT` | `8888` | Local listen port |
 | `UPSTREAM_URL` | `https://daily-cloudcode-pa.googleapis.com` | Google Cloud Code upstream endpoint |
-| `COOLDOWN_SECONDS` | `1800` | Account cooldown duration after HTTP 429 (seconds) |
+| `COOLDOWN_SECONDS` | `1800` | Fallback account cooldown duration when reset time cannot be parsed (seconds) |
+| `COOLDOWN_BUFFER_SECONDS` | `20` | Safety buffer added to Google's parsed reset time (seconds) |
 | `ACCOUNTS_FILE` | `./accounts.json` | Path to persistent accounts database |
 | `IDE_SETTINGS_FILE` | `Platform default` | Path to Antigravity `settings.json` (auto-detected on macOS, Windows, Linux) |
 | `ROTATOR_LOG_MAX_BYTES` | `5242880 (5 MB)` | Maximum log file size before rotation |

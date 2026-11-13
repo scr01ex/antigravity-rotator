@@ -30,6 +30,7 @@ HOST = os.getenv("ROTATOR_HOST", "127.0.0.1")
 PORT = int(os.getenv("ROTATOR_PORT", "8888"))
 UPSTREAM_URL = os.getenv("UPSTREAM_URL", "https://daily-cloudcode-pa.googleapis.com")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1800"))
+COOLDOWN_BUFFER_SECONDS = int(os.getenv("COOLDOWN_BUFFER_SECONDS", "20"))
 UPSTREAM_TIMEOUT = int(os.getenv("UPSTREAM_TIMEOUT", "120"))
 
 ACCOUNTS_FILE = Path(os.getenv("ACCOUNTS_FILE", str(BASE_DIR / "accounts.json"))).resolve()
